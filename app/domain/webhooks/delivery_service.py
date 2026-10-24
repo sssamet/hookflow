@@ -1,3 +1,4 @@
+import asyncio
 from time import perf_counter, sleep
 
 import httpx
@@ -13,12 +14,31 @@ MAX_RESPONSE_BODY_LENGTH = 4000
 MAX_ERROR_MESSAGE_LENGTH = 2000
 
 
+async def _async_post_request(
+    url: str,
+    payload: dict,
+) -> httpx.Response:
+    """Send a webhook request with a total execution deadline."""
+    async with httpx.AsyncClient(
+        timeout=REQUEST_TIMEOUT,
+        follow_redirects=False,
+    ) as client:
+        return await asyncio.wait_for(
+            client.post(url, json=payload),
+            timeout=REQUEST_TIMEOUT,
+        )
+
+
+def _post_request(url: str, payload: dict) -> httpx.Response:
+    """Run the async HTTP request from the synchronous service."""
+    return asyncio.run(_async_post_request(url, payload))
+
+
 def deliver_event(db: Session, event: WebhookEvent) -> WebhookDelivery:
     """Deliver an event and record each attempt in the database."""
     last_delivery = None
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
-        # Keep retries bounded to avoid endless delivery attempts.
         if attempt > 1:
             sleep(RETRY_DELAYS[attempt - 2])
 
@@ -37,21 +57,17 @@ def deliver_event(db: Session, event: WebhookEvent) -> WebhookDelivery:
         should_retry = False
 
         try:
-            validate_target_url(event.webhook.target_url)
+            target_url = event.webhook.target_url
+            validate_target_url(target_url)
 
-            with httpx.Client(
-                timeout=REQUEST_TIMEOUT,
-                follow_redirects=False,
-            ) as client:
-                response = client.post(
-                    event.webhook.target_url,
-                    json={
-                        "id": event.id,
-                        "type": event.event_type,
-                        "payload": event.payload,
-                        "created_at": event.created_at.isoformat(),
-                    },
-                )
+            payload = {
+                "id": event.id,
+                "type": event.event_type,
+                "payload": event.payload,
+                "created_at": event.created_at.isoformat(),
+            }
+
+            response = _post_request(target_url, payload)
 
             delivery.response_status_code = response.status_code
             delivery.response_body = response.text[:MAX_RESPONSE_BODY_LENGTH]
@@ -61,8 +77,16 @@ def deliver_event(db: Session, event: WebhookEvent) -> WebhookDelivery:
             else:
                 delivery.status = "failed"
                 should_retry = (
-                    response.status_code == 429 or response.status_code >= 500
+                    response.status_code == 429
+                    or response.status_code >= 500
                 )
+
+        except asyncio.TimeoutError:
+            delivery.status = "failed"
+            delivery.error_message = (
+                f"Webhook request exceeded the {REQUEST_TIMEOUT}-second timeout."
+            )[:MAX_ERROR_MESSAGE_LENGTH]
+            should_retry = True
 
         except ValueError as exc:
             delivery.status = "failed"
