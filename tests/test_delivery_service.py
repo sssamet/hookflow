@@ -1,16 +1,18 @@
+
 import asyncio
 from datetime import datetime, timezone
 from email.utils import format_datetime
 
 import httpx
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.domain.webhooks import delivery_service
 from app.domain.webhooks.models import (
     Webhook,
+    WebhookDelivery,
     WebhookEvent,
 )
 from app.infrastructure.database.base import Base
@@ -23,13 +25,13 @@ def db():
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
-    TestingSessionLocal = sessionmaker(
+    testing_session_local = sessionmaker(
         bind=engine,
         autoflush=False,
         expire_on_commit=False,
     )
     Base.metadata.create_all(bind=engine)
-    session = TestingSessionLocal()
+    session = testing_session_local()
 
     try:
         yield session
@@ -67,115 +69,155 @@ def mock_delivery_dependencies(monkeypatch):
         "validate_target_url",
         lambda url: None,
     )
-    monkeypatch.setattr(
-        delivery_service,
-        "sleep",
-        lambda seconds: None,
-    )
 
 
 def response(status_code, text="result", headers=None):
     return httpx.Response(
         status_code,
         headers=headers,
-        request=httpx.Request("POST", "https://example.com/webhook"),
+        request=httpx.Request(
+            "POST",
+            "https://example.com/webhook",
+        ),
         text=text,
     )
 
 
-def test_retries_after_timeout(db, event, monkeypatch):
-    attempts = 0
+def test_successful_delivery_makes_one_attempt(db, event, monkeypatch):
+    calls = []
 
     def fake_post(url, payload, signature):
-        nonlocal attempts
-        attempts += 1
-        if attempts < 3:
-            raise asyncio.TimeoutError
+        calls.append(url)
         return response(200, "delivered")
 
     monkeypatch.setattr(delivery_service, "_post_request", fake_post)
 
-    result = delivery_service.deliver_event(db, event)
+    result = delivery_service.deliver_event(
+        db,
+        event,
+        attempt_number=1,
+    )
 
-    assert result.status == "succeeded"
-    assert result.attempt_number == 3
-    assert attempts == 3
+    assert result.delivery.status == "succeeded"
+    assert result.delivery.attempt_number == 1
+    assert result.should_retry is False
+    assert len(calls) == 1
 
 
-def test_retries_after_server_error(db, event, monkeypatch):
-    attempts = 0
+def test_timeout_returns_retryable_result(db, event, monkeypatch):
+    calls = []
 
     def fake_post(url, payload, signature):
-        nonlocal attempts
-        attempts += 1
-        return response(503) if attempts == 1 else response(200)
+        calls.append(url)
+        raise asyncio.TimeoutError
 
     monkeypatch.setattr(delivery_service, "_post_request", fake_post)
 
     result = delivery_service.deliver_event(db, event)
 
-    assert result.status == "succeeded"
-    assert result.attempt_number == 2
-    assert attempts == 2
+    assert result.delivery.status == "failed"
+    assert result.delivery.error_message
+    assert result.should_retry is True
+    assert len(calls) == 1
 
 
-def test_does_not_retry_after_client_error(db, event, monkeypatch):
-    attempts = 0
+def test_server_error_returns_retryable_result(db, event, monkeypatch):
+    calls = []
 
     def fake_post(url, payload, signature):
-        nonlocal attempts
-        attempts += 1
+        calls.append(url)
+        return response(503, "Service Unavailable")
+
+    monkeypatch.setattr(delivery_service, "_post_request", fake_post)
+
+    result = delivery_service.deliver_event(db, event)
+
+    assert result.delivery.status == "failed"
+    assert result.delivery.response_status_code == 503
+    assert result.should_retry is True
+    assert len(calls) == 1
+
+
+def test_client_error_does_not_retry(db, event, monkeypatch):
+    calls = []
+
+    def fake_post(url, payload, signature):
+        calls.append(url)
         return response(400, "Bad Request")
 
     monkeypatch.setattr(delivery_service, "_post_request", fake_post)
 
     result = delivery_service.deliver_event(db, event)
 
-    assert result.status == "failed"
-    assert result.attempt_number == 1
-    assert attempts == 1
+    assert result.delivery.status == "failed"
+    assert result.delivery.response_status_code == 400
+    assert result.should_retry is False
+    assert len(calls) == 1
 
 
-def test_retries_after_rate_limit(db, event, monkeypatch):
-    attempts = 0
-
-    def fake_post(url, payload, signature):
-        nonlocal attempts
-        attempts += 1
-        return response(429) if attempts == 1 else response(200)
-
-    monkeypatch.setattr(delivery_service, "_post_request", fake_post)
-
-    result = delivery_service.deliver_event(db, event)
-
-    assert result.status == "succeeded"
-    assert result.attempt_number == 2
-    assert attempts == 2
-
-
-def test_respects_retry_after(db, event, monkeypatch):
-    attempts = 0
-    sleep_calls = []
-
-    def fake_post(url, payload, signature):
-        nonlocal attempts
-        attempts += 1
-        if attempts == 1:
-            return response(429, headers={"Retry-After": "5"})
-        return response(200)
-
-    monkeypatch.setattr(delivery_service, "_post_request", fake_post)
+def test_rate_limit_returns_retryable_result(db, event, monkeypatch):
     monkeypatch.setattr(
         delivery_service,
-        "sleep",
-        lambda seconds: sleep_calls.append(seconds),
+        "_post_request",
+        lambda url, payload, signature: response(429),
     )
 
     result = delivery_service.deliver_event(db, event)
 
-    assert result.status == "succeeded"
-    assert attempts == 2
-    assert sleep_calls == [5]
+    assert result.delivery.status == "failed"
+    assert result.delivery.response_status_code == 429
+    assert result.should_retry is True
+
+
+def test_respects_retry_after_header(db, event, monkeypatch):
+    monkeypatch.setattr(
+        delivery_service,
+        "_post_request",
+        lambda url, payload, signature: response(
+            429,
+            headers={"Retry-After": "5"},
+        ),
+    )
+
+    result = delivery_service.deliver_event(db, event)
+
+    assert result.should_retry is True
+    assert result.retry_after == 5
+
+
+def test_delivery_attempt_number_is_preserved(db, event, monkeypatch):
+    monkeypatch.setattr(
+        delivery_service,
+        "_post_request",
+        lambda url, payload, signature: response(200),
+    )
+
+    result = delivery_service.deliver_event(
+        db,
+        event,
+        attempt_number=2,
+    )
+
+    assert result.delivery.attempt_number == 2
+
+
+def test_delivery_is_persisted(db, event, monkeypatch):
+    monkeypatch.setattr(
+        delivery_service,
+        "_post_request",
+        lambda url, payload, signature: response(200),
+    )
+
+    delivery_service.deliver_event(db, event)
+
+    deliveries = db.scalars(
+        select(WebhookDelivery).where(
+            WebhookDelivery.event_id == event.id
+        )
+    ).all()
+
+    assert len(deliveries) == 1
+    assert deliveries[0].status == "succeeded"
 
 
 def test_parse_retry_after_http_date():
@@ -194,6 +236,7 @@ def test_parse_retry_after_caps_wait():
 
 def test_parse_retry_after_invalid_value():
     assert delivery_service._parse_retry_after("invalid") is None
+
 
 def test_generate_signature_is_valid():
     payload = b'{"event":"test.created"}'

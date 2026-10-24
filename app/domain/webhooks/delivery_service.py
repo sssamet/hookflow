@@ -3,9 +3,10 @@ import asyncio
 import hashlib
 import hmac
 import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
-from time import perf_counter, sleep
+from time import perf_counter
 
 import httpx
 from sqlalchemy.orm import Session
@@ -22,8 +23,14 @@ MAX_ERROR_MESSAGE_LENGTH = 2000
 SIGNATURE_HEADER = "X-HookFlow-Signature"
 
 
+@dataclass(frozen=True)
+class DeliveryResult:
+    delivery: WebhookDelivery
+    should_retry: bool
+    retry_after: int | None = None
+
+
 def _serialize_payload(payload: dict) -> bytes:
-    """Serialize the payload once so the signed and sent bytes match."""
     return json.dumps(
         payload,
         ensure_ascii=False,
@@ -32,7 +39,6 @@ def _serialize_payload(payload: dict) -> bytes:
 
 
 def _generate_signature(payload_bytes: bytes, secret: str) -> str:
-    """Generate an HMAC-SHA256 signature for the exact request body."""
     digest = hmac.new(
         secret.encode("utf-8"),
         payload_bytes,
@@ -46,7 +52,6 @@ async def _async_post_request(
     payload_bytes: bytes,
     signature: str,
 ) -> httpx.Response:
-    """Send the signed webhook request with a total execution deadline."""
     async with httpx.AsyncClient(
         timeout=REQUEST_TIMEOUT,
         follow_redirects=False,
@@ -69,14 +74,12 @@ def _post_request(
     payload_bytes: bytes,
     signature: str,
 ) -> httpx.Response:
-    """Run the async HTTP request from the synchronous service."""
     return asyncio.run(
         _async_post_request(url, payload_bytes, signature)
     )
 
 
 def _parse_retry_after(value: str) -> int | None:
-    """Parse Retry-After as seconds or an HTTP date."""
     try:
         seconds = int(value)
     except ValueError:
@@ -94,100 +97,90 @@ def _parse_retry_after(value: str) -> int | None:
     return min(MAX_RETRY_AFTER, max(0, seconds))
 
 
-def deliver_event(db: Session, event: WebhookEvent) -> WebhookDelivery:
-    """Deliver a signed event and record each attempt in the database."""
-    last_delivery = None
+def deliver_event(
+    db: Session,
+    event: WebhookEvent,
+    attempt_number: int = 1,
+) -> DeliveryResult:
+    """Perform and persist exactly one webhook delivery attempt."""
+    delivery = WebhookDelivery(
+        event_id=event.id,
+        attempt_number=attempt_number,
+        status="pending",
+    )
+    db.add(delivery)
+    db.commit()
+    db.refresh(delivery)
+
+    started_at = perf_counter()
+    should_retry = False
     retry_after = None
 
-    for attempt in range(1, MAX_ATTEMPTS + 1):
-        if attempt > 1:
-            delay = (
-                retry_after if retry_after is not None else RETRY_DELAYS[attempt - 2]
-            )
-            sleep(delay)
+    try:
+        target_url = event.webhook.target_url
+        validate_target_url(target_url)
 
-        retry_after = None
+        payload = {
+            "id": event.id,
+            "type": event.event_type,
+            "payload": event.payload,
+            "created_at": event.created_at.isoformat(),
+        }
 
-        delivery = WebhookDelivery(
-            event_id=event.id,
-            attempt_number=attempt,
-            status="pending",
+        payload_bytes = _serialize_payload(payload)
+        signature = _generate_signature(
+            payload_bytes,
+            event.webhook.signing_secret,
         )
 
-        db.add(delivery)
+        response = _post_request(
+            target_url,
+            payload_bytes,
+            signature,
+        )
+
+        delivery.response_status_code = response.status_code
+        delivery.response_body = response.text[:MAX_RESPONSE_BODY_LENGTH]
+
+        if 200 <= response.status_code < 300:
+            delivery.status = "succeeded"
+        else:
+            delivery.status = "failed"
+            should_retry = (
+                response.status_code == 429
+                or response.status_code >= 500
+            )
+
+            if response.status_code == 429:
+                header_value = response.headers.get("Retry-After")
+                if header_value is not None:
+                    retry_after = _parse_retry_after(header_value)
+
+    except (asyncio.TimeoutError, httpx.TimeoutException):
+        delivery.status = "failed"
+        delivery.error_message = (
+            f"Webhook request exceeded the {REQUEST_TIMEOUT}-second timeout."
+        )[:MAX_ERROR_MESSAGE_LENGTH]
+        should_retry = True
+
+    except ValueError as exc:
+        delivery.status = "failed"
+        delivery.error_message = str(exc)[:MAX_ERROR_MESSAGE_LENGTH]
+
+    except httpx.HTTPError as exc:
+        delivery.status = "failed"
+        delivery.error_message = str(exc)[:MAX_ERROR_MESSAGE_LENGTH]
+        should_retry = True
+
+    finally:
+        delivery.duration_ms = round(
+            (perf_counter() - started_at) * 1000
+        )
         db.commit()
         db.refresh(delivery)
 
-        last_delivery = delivery
-        started_at = perf_counter()
-        should_retry = False
-
-        try:
-            target_url = event.webhook.target_url
-            validate_target_url(target_url)
-
-            payload = {
-                "id": event.id,
-                "type": event.event_type,
-                "payload": event.payload,
-                "created_at": event.created_at.isoformat(),
-            }
-
-            payload_bytes = _serialize_payload(payload)
-            signature = _generate_signature(
-                payload_bytes,
-                event.webhook.signing_secret,
-            )
-
-            response = _post_request(
-                target_url,
-                payload_bytes,
-                signature,
-            )
-
-            delivery.response_status_code = response.status_code
-            delivery.response_body = response.text[:MAX_RESPONSE_BODY_LENGTH]
-
-            if 200 <= response.status_code < 300:
-                delivery.status = "succeeded"
-            else:
-                delivery.status = "failed"
-                should_retry = (
-                    response.status_code == 429 or response.status_code >= 500
-                )
-
-                if response.status_code == 429:
-                    header_value = response.headers.get("Retry-After")
-                    if header_value is not None:
-                        retry_after = _parse_retry_after(header_value)
-
-        except asyncio.TimeoutError:
-            delivery.status = "failed"
-            delivery.error_message = (
-                f"Webhook request exceeded the {REQUEST_TIMEOUT}-second timeout."
-            )[:MAX_ERROR_MESSAGE_LENGTH]
-            should_retry = True
-
-        except ValueError as exc:
-            delivery.status = "failed"
-            delivery.error_message = str(exc)[:MAX_ERROR_MESSAGE_LENGTH]
-
-        except httpx.HTTPError as exc:
-            delivery.status = "failed"
-            delivery.error_message = str(exc)[:MAX_ERROR_MESSAGE_LENGTH]
-            should_retry = True
-
-        finally:
-            delivery.duration_ms = round(
-                (perf_counter() - started_at) * 1000
-            )
-            db.commit()
-            db.refresh(delivery)
-
-        if delivery.status == "succeeded":
-            return delivery
-
-        if not should_retry or attempt == MAX_ATTEMPTS:
-            return delivery
-
-    return last_delivery
+    return DeliveryResult(
+        delivery=delivery,
+        should_retry=should_retry,
+        retry_after=retry_after,
+    )

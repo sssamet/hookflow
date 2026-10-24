@@ -1,3 +1,4 @@
+
 import logging
 import time
 from datetime import datetime, timedelta, timezone
@@ -5,9 +6,15 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
-from app.domain.webhooks.delivery_service import deliver_event
+from app.domain.webhooks.delivery_service import (
+    MAX_ATTEMPTS,
+    RETRY_DELAYS,
+    deliver_event,
+)
 from app.domain.webhooks.models import WebhookEvent, WebhookJob
 from app.infrastructure.database.session import SessionLocal
+
+logger = logging.getLogger(__name__)
 
 
 def recover_stale_jobs(
@@ -15,9 +22,8 @@ def recover_stale_jobs(
     timeout_minutes: int = 10,
 ) -> int:
     """Return stale processing jobs to the pending state."""
-    cutoff = datetime.now(timezone.utc) - timedelta(
-        minutes=timeout_minutes,
-    )
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=timeout_minutes)
 
     with session_factory() as db:
         result = db.execute(
@@ -28,12 +34,11 @@ def recover_stale_jobs(
             )
             .values(
                 status="pending",
-                scheduled_at=datetime.now(timezone.utc),
-                updated_at=datetime.now(timezone.utc),
+                scheduled_at=now,
+                updated_at=now,
             )
         )
         db.commit()
-
         return result.rowcount
 
 
@@ -46,7 +51,10 @@ def claim_pending_job(session_factory, job_id: str) -> bool:
                 WebhookJob.id == job_id,
                 WebhookJob.status == "pending",
             )
-            .values(status="processing")
+            .values(
+                status="processing",
+                updated_at=datetime.now(timezone.utc),
+            )
         )
         db.commit()
         return result.rowcount == 1
@@ -56,7 +64,7 @@ def process_pending_jobs(
     session_factory: sessionmaker,
     batch_size: int = 10,
 ) -> int:
-    """Process a batch of pending webhook jobs."""
+    """Process a batch of due webhook jobs without blocking on retries."""
     processed = 0
     recover_stale_jobs(session_factory)
     now = datetime.now(timezone.utc)
@@ -71,39 +79,54 @@ def process_pending_jobs(
             .order_by(WebhookJob.scheduled_at)
             .limit(batch_size)
         ).all()
-
         job_ids = [job.id for job in jobs]
 
     for job_id in job_ids:
+        if not claim_pending_job(session_factory, job_id):
+            continue
+
         with session_factory() as db:
-            job = db.get(WebhookJob, job_id)
-
-            if job is None:
-                continue
-
-            if not claim_pending_job(session_factory, job_id):
-                continue
-
             job = db.get(WebhookJob, job_id)
             if job is None:
                 continue
 
             event = db.get(WebhookEvent, job.event_id)
-
             if event is None:
                 job.status = "failed"
+                job.updated_at = datetime.now(timezone.utc)
                 db.commit()
+                processed += 1
                 continue
 
+            attempt_number = job.attempts + 1
+
             try:
-                delivery = deliver_event(db, event)
-                job.attempts = delivery.attempt_number
+                result = deliver_event(
+                    db,
+                    event,
+                    attempt_number=attempt_number,
+                )
+
+                delivery = result.delivery
+                job.attempts = attempt_number
+                now = datetime.now(timezone.utc)
 
                 if delivery.status == "succeeded":
                     job.status = "completed"
+
+                elif result.should_retry and attempt_number < MAX_ATTEMPTS:
+                    delay = (
+                        result.retry_after
+                        if result.retry_after is not None
+                        else RETRY_DELAYS[attempt_number - 1]
+                    )
+                    job.status = "pending"
+                    job.scheduled_at = now + timedelta(seconds=delay)
+
                 else:
                     job.status = "failed"
 
+                job.updated_at = now
                 db.commit()
                 processed += 1
 
@@ -113,11 +136,13 @@ def process_pending_jobs(
 
                 if job is not None:
                     job.status = "failed"
+                    job.updated_at = datetime.now(timezone.utc)
                     db.commit()
+
+                processed += 1
 
     return processed
 
-logger = logging.getLogger(__name__)
 
 def run_worker(poll_interval: float = 2.0) -> None:
     """Continuously process pending webhook jobs."""
@@ -127,7 +152,7 @@ def run_worker(poll_interval: float = 2.0) -> None:
         while True:
             try:
                 process_pending_jobs(SessionLocal)
-            except (ValueError, RuntimeError):
+            except Exception:
                 logger.exception("Worker polling cycle failed")
 
             time.sleep(poll_interval)

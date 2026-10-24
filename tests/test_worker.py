@@ -1,10 +1,13 @@
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
+import httpx
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from app.domain.webhooks.delivery_service import DeliveryResult
 from app.domain.webhooks.models import (
     Webhook,
     WebhookDelivery,
@@ -15,7 +18,7 @@ from app.domain.webhooks.worker import process_pending_jobs, recover_stale_jobs
 from app.infrastructure.database.base import Base
 
 
-def test_worker_completes_successful_job(monkeypatch):
+def create_test_database():
     engine = create_engine(
         "sqlite://",
         connect_args={"check_same_thread": False},
@@ -27,36 +30,68 @@ def test_worker_completes_successful_job(monkeypatch):
         expire_on_commit=False,
     )
     Base.metadata.create_all(bind=engine)
+    return engine, test_session
+
+
+def create_job(test_session, name="Worker Test", status="pending"):
+    with test_session() as db:
+        webhook = Webhook(
+            name=name,
+            target_url="https://example.com/webhook",
+        )
+        db.add(webhook)
+        db.flush()
+
+        event = WebhookEvent(
+            webhook_id=webhook.id,
+            event_type="user.created",
+            payload={"user_id": 123},
+        )
+        db.add(event)
+        db.flush()
+
+        job = WebhookJob(
+            event_id=event.id,
+            status=status,
+        )
+        db.add(job)
+        db.commit()
+        return job.id, event.id
+
+
+def fake_result(status, attempt_number, should_retry=False, retry_after=None):
+    delivery = WebhookDelivery(
+        event_id="fake-event-id",
+        attempt_number=attempt_number,
+        status=status,
+    )
+    return SimpleNamespace(
+        delivery=delivery,
+        should_retry=should_retry,
+        retry_after=retry_after,
+    )
+
+
+def test_worker_completes_successful_job(monkeypatch):
+    engine, test_session = create_test_database()
 
     try:
-        with test_session() as db:
-            webhook = Webhook(
-                name="Worker Test",
-                target_url="https://example.com/webhook",
+        job_id, _ = create_job(test_session)
+
+        def fake_deliver(db, event, attempt_number=1):
+            delivery = WebhookDelivery(
+                event_id=event.id,
+                attempt_number=attempt_number,
+                status="succeeded",
             )
-            db.add(webhook)
-            db.flush()
-
-            event = WebhookEvent(
-                webhook_id=webhook.id,
-                event_type="user.created",
-                payload={"user_id": 123},
+            return DeliveryResult(
+                delivery=delivery,
+                should_retry=False,
             )
-            db.add(event)
-            db.flush()
-
-            job = WebhookJob(event_id=event.id)
-            db.add(job)
-            db.commit()
-            job_id = job.id
-
-        class FakeDelivery:
-            status = "succeeded"
-            attempt_number = 1
 
         monkeypatch.setattr(
             "app.domain.webhooks.worker.deliver_event",
-            lambda db, event: FakeDelivery(),
+            fake_deliver,
         )
 
         processed = process_pending_jobs(test_session)
@@ -74,48 +109,116 @@ def test_worker_completes_successful_job(monkeypatch):
         engine.dispose()
 
 
-def test_worker_marks_failed_job(monkeypatch):
-    engine = create_engine(
-        "sqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-    test_session = sessionmaker(
-        bind=engine,
-        autoflush=False,
-        expire_on_commit=False,
-    )
-    Base.metadata.create_all(bind=engine)
+def test_worker_marks_permanent_failure(monkeypatch):
+    engine, test_session = create_test_database()
 
     try:
-        with test_session() as db:
-            webhook = Webhook(
-                name="Worker Failure Test",
-                target_url="https://example.com/webhook",
+        job_id, _ = create_job(test_session)
+
+        def fake_deliver(db, event, attempt_number=1):
+            delivery = WebhookDelivery(
+                event_id=event.id,
+                attempt_number=attempt_number,
+                status="failed",
             )
-            db.add(webhook)
-            db.flush()
-
-            event = WebhookEvent(
-                webhook_id=webhook.id,
-                event_type="user.created",
-                payload={"user_id": 456},
+            return DeliveryResult(
+                delivery=delivery,
+                should_retry=False,
             )
-            db.add(event)
-            db.flush()
-
-            job = WebhookJob(event_id=event.id)
-            db.add(job)
-            db.commit()
-            job_id = job.id
-
-        class FakeDelivery:
-            status = "failed"
-            attempt_number = 3
 
         monkeypatch.setattr(
             "app.domain.webhooks.worker.deliver_event",
-            lambda db, event: FakeDelivery(),
+            fake_deliver,
+        )
+
+        processed = process_pending_jobs(test_session)
+
+        assert processed == 1
+
+        with test_session() as db:
+            job = db.get(WebhookJob, job_id)
+            assert job is not None
+            assert job.status == "failed"
+            assert job.attempts == 1
+
+    finally:
+        Base.metadata.drop_all(bind=engine)
+        engine.dispose()
+
+
+def test_worker_reschedules_transient_failure(monkeypatch):
+    engine, test_session = create_test_database()
+
+    try:
+        job_id, _ = create_job(test_session)
+        calls = []
+
+        def fake_deliver(db, event, attempt_number=1):
+            calls.append(attempt_number)
+            delivery = WebhookDelivery(
+                event_id=event.id,
+                attempt_number=attempt_number,
+                status="failed",
+            )
+            return DeliveryResult(
+                delivery=delivery,
+                should_retry=True,
+                retry_after=5,
+            )
+
+        monkeypatch.setattr(
+            "app.domain.webhooks.worker.deliver_event",
+            fake_deliver,
+        )
+
+        before = datetime.now(timezone.utc)
+        processed = process_pending_jobs(test_session)
+
+        assert processed == 1
+        assert calls == [1]
+
+        with test_session() as db:
+            job = db.get(WebhookJob, job_id)
+            assert job is not None
+            assert job.status == "pending"
+            assert job.attempts == 1
+
+            scheduled_at = job.scheduled_at
+            if scheduled_at.tzinfo is None:
+                scheduled_at = scheduled_at.replace(tzinfo=timezone.utc)
+
+            assert scheduled_at >= before + timedelta(seconds=4)
+
+    finally:
+        Base.metadata.drop_all(bind=engine)
+        engine.dispose()
+
+
+def test_worker_fails_after_max_attempts(monkeypatch):
+    engine, test_session = create_test_database()
+
+    try:
+        job_id, _ = create_job(test_session)
+
+        with test_session() as db:
+            job = db.get(WebhookJob, job_id)
+            job.attempts = 2
+            db.commit()
+
+        def fake_deliver(db, event, attempt_number=1):
+            delivery = WebhookDelivery(
+                event_id=event.id,
+                attempt_number=attempt_number,
+                status="failed",
+            )
+            return DeliveryResult(
+                delivery=delivery,
+                should_retry=True,
+            )
+
+        monkeypatch.setattr(
+            "app.domain.webhooks.worker.deliver_event",
+            fake_deliver,
         )
 
         processed = process_pending_jobs(test_session)
@@ -134,45 +237,14 @@ def test_worker_marks_failed_job(monkeypatch):
 
 
 def test_worker_skips_job_already_processing(monkeypatch):
-    engine = create_engine(
-        "sqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-    test_session = sessionmaker(
-        bind=engine,
-        autoflush=False,
-        expire_on_commit=False,
-    )
-    Base.metadata.create_all(bind=engine)
+    engine, test_session = create_test_database()
 
     try:
-        with test_session() as db:
-            webhook = Webhook(
-                name="Processing Test",
-                target_url="https://example.com/webhook",
-            )
-            db.add(webhook)
-            db.flush()
-
-            event = WebhookEvent(
-                webhook_id=webhook.id,
-                event_type="user.created",
-                payload={"user_id": 789},
-            )
-            db.add(event)
-            db.flush()
-
-            job = WebhookJob(
-                event_id=event.id,
-                status="processing",
-            )
-            db.add(job)
-            db.commit()
+        create_job(test_session, status="processing")
 
         monkeypatch.setattr(
             "app.domain.webhooks.worker.deliver_event",
-            lambda db, event: (_ for _ in ()).throw(
+            lambda *args, **kwargs: (_ for _ in ()).throw(
                 AssertionError("Processing job should not be delivered")
             ),
         )
@@ -186,46 +258,19 @@ def test_worker_skips_job_already_processing(monkeypatch):
         engine.dispose()
 
 
-
 def test_recover_stale_job():
-    engine = create_engine(
-        "sqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-    test_session = sessionmaker(
-        bind=engine,
-        autoflush=False,
-        expire_on_commit=False,
-    )
-    Base.metadata.create_all(bind=engine)
+    engine, test_session = create_test_database()
 
     try:
+        job_id, _ = create_job(test_session)
+
         with test_session() as db:
-            webhook = Webhook(
-                name="Recovery Test",
-                target_url="https://example.com/webhook",
+            job = db.get(WebhookJob, job_id)
+            job.status = "processing"
+            job.updated_at = datetime.now(timezone.utc) - timedelta(
+                minutes=15
             )
-            db.add(webhook)
-            db.flush()
-
-            event = WebhookEvent(
-                webhook_id=webhook.id,
-                event_type="user.created",
-                payload={"user_id": 999},
-            )
-            db.add(event)
-            db.flush()
-
-            job = WebhookJob(
-                event_id=event.id,
-                status="processing",
-                updated_at=datetime.now(timezone.utc)
-                - timedelta(minutes=15),
-            )
-            db.add(job)
             db.commit()
-            job_id = job.id
 
         recovered = recover_stale_jobs(test_session)
 
@@ -242,41 +287,15 @@ def test_recover_stale_job():
 
 
 def test_worker_delivers_event_and_records_delivery(monkeypatch):
-    engine = create_engine(
-        "sqlite://",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-    test_session = sessionmaker(
-        bind=engine,
-        autoflush=False,
-        expire_on_commit=False,
-    )
-    Base.metadata.create_all(bind=engine)
+    from app.domain.webhooks import delivery_service
+
+    engine, test_session = create_test_database()
 
     try:
-        with test_session() as db:
-            webhook = Webhook(
-                name="Delivery Integration Test",
-                target_url="https://example.com/webhook",
-            )
-            db.add(webhook)
-            db.flush()
-
-            event = WebhookEvent(
-                webhook_id=webhook.id,
-                event_type="user.created",
-                payload={"user_id": 123},
-            )
-            db.add(event)
-            db.flush()
-
-            job = WebhookJob(event_id=event.id)
-            db.add(job)
-            db.commit()
-            job_id = job.id
-
-        from app.domain.webhooks import delivery_service
+        job_id, event_id = create_job(
+            test_session,
+            name="Delivery Integration Test",
+        )
 
         monkeypatch.setattr(
             delivery_service,
@@ -285,15 +304,10 @@ def test_worker_delivers_event_and_records_delivery(monkeypatch):
         )
         monkeypatch.setattr(
             delivery_service,
-            "sleep",
-            lambda seconds: None,
-        )
-        monkeypatch.setattr(
-            delivery_service,
             "_post_request",
-            lambda url, payload, signature: __import__("httpx").Response(
+            lambda url, payload, signature: httpx.Response(
                 200,
-                request=__import__("httpx").Request("POST", url),
+                request=httpx.Request("POST", url),
                 text="delivered",
             ),
         )
@@ -310,7 +324,7 @@ def test_worker_delivers_event_and_records_delivery(monkeypatch):
 
             deliveries = db.scalars(
                 select(WebhookDelivery).where(
-                    WebhookDelivery.event_id == job.event_id
+                    WebhookDelivery.event_id == event_id
                 )
             ).all()
 
