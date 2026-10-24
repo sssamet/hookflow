@@ -194,3 +194,50 @@ def test_parse_retry_after_caps_wait():
 
 def test_parse_retry_after_invalid_value():
     assert delivery_service._parse_retry_after("invalid") is None
+
+def test_generate_signature_is_valid():
+    payload = b'{"event":"test.created"}'
+    secret = "test-secret"
+
+    signature = delivery_service._generate_signature(
+        payload,
+        secret,
+    )
+
+    expected = delivery_service.hmac.new(
+        secret.encode("utf-8"),
+        payload,
+        delivery_service.hashlib.sha256,
+    ).hexdigest()
+
+    assert signature == f"sha256={expected}"
+
+
+def test_generate_signature_changes_with_payload():
+    secret = "test-secret"
+
+    original_signature = delivery_service._generate_signature(
+        b'{"event":"test.created"}',
+        secret,
+    )
+    modified_signature = delivery_service._generate_signature(
+        b'{"event":"test.updated"}',
+        secret,
+    )
+
+    assert original_signature != modified_signature
+
+
+def test_generate_signature_changes_with_secret():
+    payload = b'{"event":"test.created"}'
+
+    first_signature = delivery_service._generate_signature(
+        payload,
+        "first-secret",
+    )
+    second_signature = delivery_service._generate_signature(
+        payload,
+        "second-secret",
+    )
+
+    assert first_signature != second_signature
