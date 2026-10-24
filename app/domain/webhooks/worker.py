@@ -130,7 +130,11 @@ def process_pending_jobs(
                 db.commit()
                 processed += 1
 
-            except (ValueError, RuntimeError):
+            except Exception:
+                logger.exception(
+                    "Unexpected error while processing webhook job %s",
+                    job_id,
+                )
                 db.rollback()
                 job = db.get(WebhookJob, job_id)
 
@@ -140,7 +144,7 @@ def process_pending_jobs(
                     db.commit()
 
                 processed += 1
-
+                
     return processed
 
 

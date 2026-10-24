@@ -335,3 +335,32 @@ def test_worker_delivers_event_and_records_delivery(monkeypatch):
     finally:
         Base.metadata.drop_all(bind=engine)
         engine.dispose()
+        
+
+def test_worker_marks_job_failed_on_unexpected_error(monkeypatch):
+    engine, test_session = create_test_database()
+
+    try:
+        job_id, _ = create_job(test_session)
+
+        def fail_delivery(db, event, attempt_number=1):
+            raise OSError("Unexpected delivery failure")
+
+        monkeypatch.setattr(
+            "app.domain.webhooks.worker.deliver_event",
+            fail_delivery,
+        )
+
+        processed = process_pending_jobs(test_session)
+
+        assert processed == 1
+
+        with test_session() as db:
+            job = db.get(WebhookJob, job_id)
+            assert job is not None
+            assert job.status == "failed"
+
+    finally:
+        Base.metadata.drop_all(bind=engine)
+        engine.dispose()
+
