@@ -77,8 +77,7 @@ def deliver_event(db: Session, event: WebhookEvent) -> WebhookDelivery:
             else:
                 delivery.status = "failed"
                 should_retry = (
-                    response.status_code == 429
-                    or response.status_code >= 500
+                    response.status_code == 429 or response.status_code >= 500
                 )
 
         except asyncio.TimeoutError:
