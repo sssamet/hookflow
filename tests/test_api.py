@@ -1,4 +1,3 @@
-
 import asyncio
 
 import httpx
@@ -97,6 +96,7 @@ def test_http_target_url_is_rejected():
         validate_target_url("http://127.0.0.1:8000")
 
 
+
 def test_async_post_request_enforces_total_timeout(monkeypatch):
     class SlowAsyncClient:
         def __init__(self, **kwargs):
@@ -108,7 +108,7 @@ def test_async_post_request_enforces_total_timeout(monkeypatch):
         async def __aexit__(self, exc_type, exc, traceback):
             return None
 
-        async def post(self, url, json):
+        async def post(self, url, content, headers):
             await asyncio.sleep(0.1)
             return httpx.Response(
                 200,
@@ -126,9 +126,11 @@ def test_async_post_request_enforces_total_timeout(monkeypatch):
         asyncio.run(
             delivery_service._async_post_request(
                 "https://example.com/webhook",
-                {"event": "test"},
+                b'{"event":"test"}',
+                "sha256=test-signature",
             )
         )
+
 
 
 def test_parse_retry_after_http_date():

@@ -1,3 +1,5 @@
+
+import secrets
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -26,6 +28,11 @@ class Webhook(Base):
     target_url: Mapped[str] = mapped_column(
         String(2048),
         nullable=False,
+    )
+    signing_secret: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default=lambda: secrets.token_hex(32),
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -69,7 +76,6 @@ class WebhookEvent(Base):
     webhook: Mapped["Webhook"] = relationship(
         back_populates="events",
     )
-
     deliveries: Mapped[list["WebhookDelivery"]] = relationship(
         back_populates="event",
         cascade="all, delete-orphan",
@@ -124,6 +130,7 @@ class WebhookDelivery(Base):
         back_populates="deliveries",
     )
 
+
 class WebhookJob(Base):
     __tablename__ = "webhook_jobs"
 
@@ -167,4 +174,4 @@ class WebhookJob(Base):
         nullable=False,
     )
 
-    event: Mapped["WebhookEvent"] = relationship() 
+    event: Mapped["WebhookEvent"] = relationship()

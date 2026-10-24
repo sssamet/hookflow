@@ -291,7 +291,7 @@ def test_worker_delivers_event_and_records_delivery(monkeypatch):
         monkeypatch.setattr(
             delivery_service,
             "_post_request",
-            lambda url, payload: __import__("httpx").Response(
+            lambda url, payload, signature: __import__("httpx").Response(
                 200,
                 request=__import__("httpx").Request("POST", url),
                 text="delivered",

@@ -1,4 +1,8 @@
+
 import asyncio
+import hashlib
+import hmac
+import json
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from time import perf_counter, sleep
@@ -15,26 +19,60 @@ MAX_RETRY_AFTER = 60
 REQUEST_TIMEOUT = 10.0
 MAX_RESPONSE_BODY_LENGTH = 4000
 MAX_ERROR_MESSAGE_LENGTH = 2000
+SIGNATURE_HEADER = "X-HookFlow-Signature"
+
+
+def _serialize_payload(payload: dict) -> bytes:
+    """Serialize the payload once so the signed and sent bytes match."""
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _generate_signature(payload_bytes: bytes, secret: str) -> str:
+    """Generate an HMAC-SHA256 signature for the exact request body."""
+    digest = hmac.new(
+        secret.encode("utf-8"),
+        payload_bytes,
+        hashlib.sha256,
+    ).hexdigest()
+    return f"sha256={digest}"
 
 
 async def _async_post_request(
     url: str,
-    payload: dict,
+    payload_bytes: bytes,
+    signature: str,
 ) -> httpx.Response:
-    """Send a webhook request with a total execution deadline."""
+    """Send the signed webhook request with a total execution deadline."""
     async with httpx.AsyncClient(
         timeout=REQUEST_TIMEOUT,
         follow_redirects=False,
     ) as client:
         return await asyncio.wait_for(
-            client.post(url, json=payload),
+            client.post(
+                url,
+                content=payload_bytes,
+                headers={
+                    "Content-Type": "application/json",
+                    SIGNATURE_HEADER: signature,
+                },
+            ),
             timeout=REQUEST_TIMEOUT,
         )
 
 
-def _post_request(url: str, payload: dict) -> httpx.Response:
+def _post_request(
+    url: str,
+    payload_bytes: bytes,
+    signature: str,
+) -> httpx.Response:
     """Run the async HTTP request from the synchronous service."""
-    return asyncio.run(_async_post_request(url, payload))
+    return asyncio.run(
+        _async_post_request(url, payload_bytes, signature)
+    )
 
 
 def _parse_retry_after(value: str) -> int | None:
@@ -47,7 +85,9 @@ def _parse_retry_after(value: str) -> int | None:
             if retry_at.tzinfo is None:
                 retry_at = retry_at.replace(tzinfo=timezone.utc)
 
-            seconds = int((retry_at - datetime.now(timezone.utc)).total_seconds())
+            seconds = int(
+                (retry_at - datetime.now(timezone.utc)).total_seconds()
+            )
         except (TypeError, ValueError, OverflowError):
             return None
 
@@ -55,7 +95,7 @@ def _parse_retry_after(value: str) -> int | None:
 
 
 def deliver_event(db: Session, event: WebhookEvent) -> WebhookDelivery:
-    """Deliver an event and record each attempt in the database."""
+    """Deliver a signed event and record each attempt in the database."""
     last_delivery = None
     retry_after = None
 
@@ -93,7 +133,17 @@ def deliver_event(db: Session, event: WebhookEvent) -> WebhookDelivery:
                 "created_at": event.created_at.isoformat(),
             }
 
-            response = _post_request(target_url, payload)
+            payload_bytes = _serialize_payload(payload)
+            signature = _generate_signature(
+                payload_bytes,
+                event.webhook.signing_secret,
+            )
+
+            response = _post_request(
+                target_url,
+                payload_bytes,
+                signature,
+            )
 
             delivery.response_status_code = response.status_code
             delivery.response_body = response.text[:MAX_RESPONSE_BODY_LENGTH]
@@ -128,7 +178,9 @@ def deliver_event(db: Session, event: WebhookEvent) -> WebhookDelivery:
             should_retry = True
 
         finally:
-            delivery.duration_ms = round((perf_counter() - started_at) * 1000)
+            delivery.duration_ms = round(
+                (perf_counter() - started_at) * 1000
+            )
             db.commit()
             db.refresh(delivery)
 

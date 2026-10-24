@@ -86,7 +86,7 @@ def response(status_code, text="result", headers=None):
 def test_retries_after_timeout(db, event, monkeypatch):
     attempts = 0
 
-    def fake_post(url, payload):
+    def fake_post(url, payload, signature):
         nonlocal attempts
         attempts += 1
         if attempts < 3:
@@ -105,7 +105,7 @@ def test_retries_after_timeout(db, event, monkeypatch):
 def test_retries_after_server_error(db, event, monkeypatch):
     attempts = 0
 
-    def fake_post(url, payload):
+    def fake_post(url, payload, signature):
         nonlocal attempts
         attempts += 1
         return response(503) if attempts == 1 else response(200)
@@ -122,7 +122,7 @@ def test_retries_after_server_error(db, event, monkeypatch):
 def test_does_not_retry_after_client_error(db, event, monkeypatch):
     attempts = 0
 
-    def fake_post(url, payload):
+    def fake_post(url, payload, signature):
         nonlocal attempts
         attempts += 1
         return response(400, "Bad Request")
@@ -139,7 +139,7 @@ def test_does_not_retry_after_client_error(db, event, monkeypatch):
 def test_retries_after_rate_limit(db, event, monkeypatch):
     attempts = 0
 
-    def fake_post(url, payload):
+    def fake_post(url, payload, signature):
         nonlocal attempts
         attempts += 1
         return response(429) if attempts == 1 else response(200)
@@ -157,7 +157,7 @@ def test_respects_retry_after(db, event, monkeypatch):
     attempts = 0
     sleep_calls = []
 
-    def fake_post(url, payload):
+    def fake_post(url, payload, signature):
         nonlocal attempts
         attempts += 1
         if attempts == 1:
