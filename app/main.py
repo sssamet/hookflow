@@ -7,8 +7,12 @@ from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.domain.webhooks.delivery_service import deliver_event
-from app.domain.webhooks.models import Webhook, WebhookDelivery, WebhookEvent
+from app.domain.webhooks.models import (
+    Webhook,
+    WebhookDelivery,
+    WebhookEvent,
+    WebhookJob,
+)
 from app.domain.webhooks.url_validator import validate_target_url
 from app.infrastructure.database.session import get_db
 
@@ -64,7 +68,7 @@ class DeliveryResponse(BaseModel):
 
 class EventCreatedResponse(BaseModel):
     event: EventResponse
-    delivery: DeliveryResponse
+    status: str
 
 
 @app.get("/health")
@@ -114,6 +118,12 @@ def list_webhooks(db: Session = Depends(get_db)):
     response_model=EventCreatedResponse,
     status_code=status.HTTP_201_CREATED,
 )
+
+@app.post(
+    "/webhooks/{webhook_id}/events",
+    response_model=EventCreatedResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
 def create_event(
     webhook_id: UUID,
     data: EventCreate,
@@ -134,15 +144,19 @@ def create_event(
     )
 
     db.add(event)
+    db.flush()
+
+    job = WebhookJob(event_id=event.id)
+    db.add(job)
+
     db.commit()
     db.refresh(event)
 
-    delivery = deliver_event(db, event)
-
     return {
         "event": event,
-        "delivery": delivery,
+        "status": "pending",
     }
+
 
 
 @app.get(
