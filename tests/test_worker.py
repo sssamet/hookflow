@@ -14,7 +14,11 @@ from app.domain.webhooks.models import (
     WebhookEvent,
     WebhookJob,
 )
-from app.domain.webhooks.worker import process_pending_jobs, recover_stale_jobs
+from app.domain.webhooks.worker import (
+    claim_pending_job,
+    process_pending_jobs,
+    recover_stale_jobs,
+)
 from app.infrastructure.database.base import Base
 
 
@@ -364,3 +368,23 @@ def test_worker_marks_job_failed_on_unexpected_error(monkeypatch):
         Base.metadata.drop_all(bind=engine)
         engine.dispose()
 
+def test_only_one_worker_can_claim_pending_job():
+    engine, test_session = create_test_database()
+
+    try:
+        job_id, _ = create_job(test_session)
+
+        first_claim = claim_pending_job(test_session, job_id)
+        second_claim = claim_pending_job(test_session, job_id)
+
+        assert first_claim is True
+        assert second_claim is False
+
+        with test_session() as db:
+            job = db.get(WebhookJob, job_id)
+            assert job is not None
+            assert job.status == "processing"
+
+    finally:
+        Base.metadata.drop_all(bind=engine)
+        engine.dispose()
